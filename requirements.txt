@@ -1,0 +1,48 @@
+# EmoMV EDA — Python Dependencies
+# Platform: macOS Apple Silicon (M5) · Python 3.11+
+# Install: pip install -r requirements.txt
+
+# ── Core numerics & data ──────────────────────────────────────────
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.11.0
+
+# ── Visualisation ─────────────────────────────────────────────────
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# ── HDF5 feature files ────────────────────────────────────────────
+h5py>=3.9.0
+
+# ── Video decoding & frame extraction ────────────────────────────
+opencv-python>=4.8.0          # cv2 — frame-level access
+Pillow>=10.0.0                # PIL — image transforms
+
+# ── Progress bars ─────────────────────────────────────────────────
+tqdm>=4.65.0
+
+# ── Statistics (stratification tests) ────────────────────────────
+statsmodels>=0.14.0
+
+# ── Notebook environment ──────────────────────────────────────────
+jupyterlab>=4.0.0
+ipywidgets>=8.0.0
+
+# ── NOTE: ffprobe (used for video metadata extraction) is a CLI
+#    tool from FFmpeg — install via Homebrew, NOT pip:
+#
+#        brew install ffmpeg
+#
+#    Verify: ffprobe -version
+
+# ── Deep learning (frozen VideoMAE / CLIP encoders + fusion classifier) ──
+torch==2.12.1                 # MPS-enabled build on Apple Silicon
+torchvision==0.27.1
+transformers==5.12.1          # VideoMAE + CLIP model/processor classes, MusicGen (Stage C)
+scikit-learn==1.9.0           # StratifiedGroupKFold, classification_report
+PyYAML==6.0.3                 # configs/config.yaml loading
+
+# ── Audio (Stage C: MusicGen bridge/conditioner training) ────────
+torchaudio==2.11.0             # waveform loading/resampling for EnCodec input
+soundfile==0.14.0              # audio I/O backend for torchaudio
+torchcodec==0.14.0             # required by torchaudio.load in 2.11.0 (default backends deprecated)

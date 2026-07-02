@@ -1,0 +1,8 @@
+dataset,split,total_rows,files_on_disk,unique_vid_emotions,unique_mus_emotions,matched_pairs,mismatched_pairs,coverage_pct
+DS1,test,248,248,5,5,124,124,100.0
+DS1,train,4110,4110,5,5,2208,1902,100.0
+DS1,val,556,556,5,5,310,246,100.0
+DS2,train,496,496,5,5,248,248,100.0
+DS2,val,120,120,5,5,60,60,100.0
+DS3,train,360,360,5,5,180,180,100.0
+DS3,val,96,96,5,5,48,48,100.0

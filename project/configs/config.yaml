@@ -1,0 +1,145 @@
+# EmoMV frozen-encoder video emotion classification — central config.
+# Every path/hyperparameter/threshold used by the pipeline lives here.
+# Paths are resolved relative to the repo root (parent of `project/`).
+
+seed: 42
+
+paths:
+  # Root of the raw EmoMV dataset (mirrors emomv_eda.ipynb BASE_DIR).
+  base_dir: "aria/media/minhdanh/5e31d1e3-0187-4837-8530-60bbac61578f1/home/minhdanh/Documents/EmoMV"
+  data_dir: "project/data"
+  manifest_csv: "project/data/manifest.csv"
+  duplicates_csv: "project/data/duplicates_report.csv"
+  duration_outliers_csv: "project/data/duration_outliers.csv"
+  train_csv: "project/data/train.csv"
+  val_csv: "project/data/val.csv"
+  test_csv: "project/data/test.csv"
+  features_dir: "project/features"
+  videomae_features_dir: "project/features/videomae"
+  clip_features_dir: "project/features/clip"
+  video_embedding_512_dir: "project/features/video_embedding_512"
+  text_model_path: "project/text_mood_clf_encoder/text_mood_clf"
+  checkpoints_dir: "project/training/checkpoints"
+  logs_dir: "project/logs"
+  results_dir: "project/evaluation/results"
+  audio_targets_dir: "project/features/audio_targets"
+
+annotation_files:
+  # (dataset, split) -> csv path relative to paths.base_dir
+  - dataset: DS1
+    split: train
+    csv: "Dataset1/annotation/DS1_TRAIN_MATCH_MISMATCH_labels.csv"
+  - dataset: DS1
+    split: val
+    csv: "Dataset1/annotation/DS1_VAL_MATCH_MISMATCH_labels.csv"
+  - dataset: DS1
+    split: test
+    csv: "Dataset1/annotation/DS1_TEST_MATCH_MISMATCH_labels.csv"
+  - dataset: DS2
+    split: train
+    csv: "Dataset2/annotation/DS2_TRAIN_MATCH_MISMATCH_labels.csv"
+  - dataset: DS2
+    split: val
+    csv: "Dataset2/annotation/DS2_VAL_MATCH_MISMATCH_labels.csv"
+  - dataset: DS3
+    split: train
+    csv: "Dataset3/annotation/DS3_TRAIN_MATCH_MISMATCH_labels.csv"
+  - dataset: DS3
+    split: val
+    csv: "Dataset3/annotation/DS3_VAL_MATCH_MISMATCH_labels.csv"
+
+emotion_to_id:
+  exciting: 0
+  fear: 1
+  tense: 2
+  sad: 3
+  relax: 4
+
+emotion_aliases:
+  happy: exciting
+  contentment: relax
+  relaxing: relax
+  excitement: exciting
+  fearful: fear
+  tension: tense
+
+# Only match_lbl == 1 rows are kept (avoids MISMATCH label ambiguity / leakage).
+match_lbl_keep: 1
+
+duration:
+  # Nominal clip length. Windowing only triggers past max_duration + tolerance,
+  # since ~68% of clips sit at 30.0-30.5s purely from encoding rounding.
+  max_duration_s: 30
+  tolerance_s: 5
+  window_s: 30
+  min_window_remainder_s: 5   # drop a trailing window shorter than this
+
+split:
+  train_frac: 0.70
+  val_frac: 0.15
+  test_frac: 0.15
+  stratify_col: emotion_id
+  group_col: source_group_id
+
+dataset:
+  num_frames: 16
+  resize_shorter_edge: 256
+  crop_size: 224
+
+encoders:
+  videomae_model: "MCG-NJU/videomae-base"
+  clip_model: "openai/clip-vit-base-patch32"
+  device_preference: ["mps", "cuda", "cpu"]
+  batch_size: 8
+
+training:
+  batch_size: 32
+  num_workers: 4
+  lr: 0.0003
+  weight_decay: 0.0001
+  max_epochs: 100
+  early_stopping_patience: 10
+  early_stopping_metric: "val_macro_f1"
+  class_imbalance_strategy: "class_weights"   # "class_weights" or "weighted_sampler"
+  fusion_hidden_dim: 512
+  fusion_dropout: 0.3
+  baseline_hidden_dim: 256
+  baseline_dropout: 0.3
+
+# Stage B — cross-modal alignment (see project/docs/cross_modal_alignment_plan.pdf).
+# Text side uses only the 5 class-name strings as fixed anchors (no text training
+# corpus is available) -- see that document's "core feasibility question" section
+# for why this is a deliberate, honest simplification rather than an oversight.
+alignment:
+  shared_dim: 256              # start here; only raise to 512 if retrieval plateaus (see plan doc)
+  adapter_dropout: 0.15
+  batch_size: 128
+  lr: 0.001
+  weight_decay: 0.0001
+  max_epochs: 200
+  early_stopping_patience: 15
+  early_stopping_metric: "val_v2t_accuracy"
+  logit_scale_init: 14.2857    # 1/0.07, same init CLIP uses
+  logit_scale_max: 100.0
+
+# Stage C, Milestone 1 — bridge/conditioner training (see plan doc Section 4).
+# MusicGen stays fully frozen; only the bridge (models/bridge.py) is trained.
+# Conditioning targets are the MATCH clips' own soundtracks, used as-is
+# (may include vocals/dialogue -- accepted for this milestone, see plan doc).
+stage_c:
+  musicgen_model: "facebook/musicgen-small"
+  audio_sample_rate: 32000     # EnCodec's expected input rate for musicgen-small
+  audio_channels: 1            # musicgen-small's EnCodec is mono
+  clip_duration_s: 10          # truncate/pad each clip's audio to this length for training speed
+  bridge_seq_len: 8            # length of the pseudo-sequence the bridge emits
+  bridge_hidden_dim: 512
+  bridge_n_heads: 4
+  bridge_n_layers: 2
+  bridge_dropout: 0.1
+  batch_size: 4
+  lr: 0.0003
+  weight_decay: 0.00001
+  max_epochs: 2                # small-subset validation run first (see plan doc roadmap)
+  subset_size: 300              # number of clips for the initial small-scale sanity pass
+  early_stopping_patience: 5
+  device_preference: ["mps", "cuda", "cpu"]

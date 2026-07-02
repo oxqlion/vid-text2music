@@ -1,0 +1,31 @@
+# ── Python ─────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.claude/
+.ipynb_checkpoints/
+
+# ── OS ─────────────────────────────────────────────────────────
+.DS_Store
+
+# ── Raw dataset archives (tens of GB, redownloadable — see aria/emomv_urls.txt) ──
+aria/
+EmoMV.z*
+EmoMV.zip
+emomv_2_fine tune_1.zip
+
+# ── Cached/derived features (regenerable via project/features/*.py) ──
+project/features/videomae/
+project/features/clip/
+project/features/slowfast/
+project/features/video_embedding_512/
+project/features/audio_targets/
+
+# ── Trained model artifacts (regenerable via project/training/*.py; too large for git) ──
+project/training/checkpoints/
+project/text_mood_clf_encoder/text_mood_clf.zip
+project/text_mood_clf_encoder/text_mood_clf/
+
+# ── Logs ───────────────────────────────────────────────────────
+project/logs/*

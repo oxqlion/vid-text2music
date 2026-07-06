@@ -1,0 +1,296 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric,arrows.meta,positioning,fit,backgrounds}
+\usepackage{longtable}
+\usepackage{caption}
+\usepackage{tabularx}
+\usepackage{graphicx}
+\hypersetup{colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black}
+\sloppy
+
+\newcommand{\good}{\textcolor{green!50!black}{\textbf{Feasible}}}
+\newcommand{\risky}{\textcolor{orange!80!black}{\textbf{Feasible, higher risk}}}
+\newcommand{\hard}{\textcolor{red!70!black}{\textbf{Resource-limited}}}
+
+\title{\textbf{Dual Conditioning for MusicGen: Combining Raw-Text Semantics\\ with Mood-Embedding Steering}\\
+\large A New Approach to Stage C, Building on the Bridge Adapter}
+\author{EmoMV Project}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section*{Executive Summary}
+\addcontentsline{toc}{section}{Executive Summary}
+
+The current Stage C design (Milestone 1, implemented in \texttt{project/models/bridge.py} and
+\texttt{08\_bridge.ipynb}) discards the original input text entirely once it has been classified.
+A video or sentence is mapped, via the frozen Stage~A/B encoders and adapters, to a single 256-d
+point $z$ in the shared mood space; the bridge network turns $z$ into a synthetic
+$(T,\,768)$ pseudo-sequence that \emph{replaces} MusicGen's normal T5 text-conditioning input
+outright (\texttt{encoder\_outputs=(bridge\_output,)}, bypassing the T5 call). This is sufficient
+signal for \emph{which of 5 mood classes} to generate toward, but it throws away everything else
+in the input text --- instrumentation, tempo, genre, and any descriptive detail beyond the mood
+label.
+
+\textbf{Proposed change:} keep the bridge exactly as designed for mood steering, but stop
+bypassing MusicGen's own frozen T5 encoder. Run the raw input text through T5 \emph{as MusicGen
+already knows how to consume it}, run the same text (or a video's aligned embedding) through the
+existing bridge for mood steering, and \textbf{concatenate the two conditioning sequences} along
+the time axis before handing them to the frozen decoder's cross-attention. This is not a redesign
+of Stage C --- it is a one-line change in what gets passed as \texttt{encoder\_outputs}, verified
+directly against the installed \texttt{transformers} MusicGen source (Section~\ref{sec:mechanism}).
+
+\textbf{Verdict: feasible with no MusicGen fine-tuning of any kind.} MusicGen's T5 encoder and LM
+decoder remain fully frozen, exactly as in the existing plan. The only thing that must be
+\emph{retrained} is the small bridge network itself (already a trained component, not a frozen
+one) --- because it has so far only ever been trained as the \emph{sole} conditioning signal, and
+needs to learn to steer mood \emph{alongside} real T5 tokens rather than in place of them.
+
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}X l X@{}}
+\toprule
+\textbf{Component} & \textbf{Status under this proposal} & \textbf{Notes} \\
+\midrule
+T5 text encoder (MusicGen's own) & Frozen, now actually used & Currently unused at inference time; the bridge fully replaces it \\
+EnCodec tokenizer / LM decoder & Frozen (unchanged) & Same as current plan \\
+Bridge network & Retrain (small, cheap) & Same module, new training context (concatenated conditioning) \\
+Stage B alignment adapters & Frozen (unchanged) & Still the source of the mood vector $z$ \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Motivation}
+
+\subsection{What the current design gives up}
+Section~\ref{sec:pairing-recap} of the existing cross-modal alignment plan is explicit about what
+label-anchored contrastive alignment does \emph{not} buy: two very different scenes sharing a
+label (``a rainy evening with tea'' vs.\ ``a quiet mountain hike,'' both \emph{relax}) land at
+nearly the same point in the shared space. That is fine for the alignment space itself, whose job
+is coarse mood separation. But the current Stage C bridge takes \emph{only} that collapsed point
+as MusicGen's entire conditioning input. Any richer information present in the original text ---
+``a slow acoustic guitar piece for a quiet mountain hike'' carries genre and instrumentation cues
+that ``relax'' alone does not --- is computed by T5 internally in stock MusicGen usage, but never
+reaches the decoder in this project's current pipeline, because \texttt{encoder\_outputs} is
+overwritten by the bridge before the forward pass ever gets there.
+
+\subsection{Why MusicGen is a natural fit for adding this back}
+MusicGen does not consume a single vector for text conditioning; it consumes a \emph{sequence} of
+T5 hidden states, cross-attended by every decoder layer, with an accompanying padding mask that
+already handles variable-length conditioning inputs. Concatenating a second sequence (the bridge's
+mood tokens) onto the first (T5's semantic tokens) is not a structural change to how MusicGen
+attends over conditioning --- it is the same mechanism MusicGen already uses for batched,
+variable-length text prompts, just with two sources instead of one.
+
+\section{Proposed Mechanism}
+\label{sec:mechanism}
+
+\subsection{Verified against the installed \texttt{transformers} source}
+Inspecting \texttt{MusicgenForConditionalGeneration.forward} directly
+(\texttt{transformers/models/musicgen/modeling\_musicgen.py}) confirms the exact contract:
+\begin{itemize}
+\item If \texttt{encoder\_outputs} is not supplied, MusicGen calls \texttt{self.text\_encoder}
+(T5) itself to produce it from \texttt{input\_ids}/\texttt{attention\_mask}.
+\item If \texttt{encoder\_outputs} \emph{is} supplied (a tuple), it is wrapped directly into a
+\texttt{BaseModelOutput} and used as-is --- this is the hook the current bridge already exploits.
+\item The top-level \texttt{attention\_mask} is used twice: to zero out masked positions of
+\texttt{encoder\_hidden\_states} (\texttt{encoder\_hidden\_states *= attention\_mask[..., None]}),
+and passed straight through to the decoder as \texttt{encoder\_attention\_mask} for
+cross-attention.
+\end{itemize}
+Nothing in this contract assumes \texttt{encoder\_outputs} came from a single source or has a
+particular sequence length. A concatenation of two sequences with a concatenated mask is a
+first-class supported input, not a workaround.
+
+\subsection{The combined forward pass}
+For an input consisting of raw text (and/or, symmetrically, a video's aligned embedding):
+\begin{enumerate}
+\item \textbf{Semantic branch (new):} tokenize the raw text and run it through MusicGen's own
+frozen \texttt{text\_encoder} (T5) to get $(B, T_{\text{text}}, 768)$ hidden states plus its
+padding mask. This is exactly what stock MusicGen does with a text prompt --- nothing new is
+trained here.
+\item \textbf{Mood branch (existing, unchanged):} encode the same input through the frozen
+Stage~A/B pipeline to the shared 256-d vector $z$ (video adapter or text adapter, whichever
+modality applies), then through the existing bridge to get $(B, T_{\text{bridge}}, 768)$, with an
+all-ones mask (as today).
+\item \textbf{Combine:}
+\[
+\text{cond} = \big[\, \text{T5}(\text{text}) \,;\, \text{bridge}(z) \,\big] \in
+\mathbb{R}^{B \times (T_{\text{text}} + T_{\text{bridge}}) \times 768}, \qquad
+\text{mask} = \big[\, \text{mask}_{\text{T5}} \,;\, \mathbf{1}_{T_{\text{bridge}}} \,\big]
+\]
+\item Pass \texttt{encoder\_outputs=(cond,)} and \texttt{attention\_mask=mask} to
+\texttt{MusicgenForConditionalGeneration.forward} (training) or \texttt{.generate} (inference),
+exactly where the bridge output alone is passed today.
+\end{enumerate}
+
+\subsection{What stays frozen, what gets retrained}
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}X l@{}}
+\toprule
+\textbf{Component} & \textbf{Trainable?} \\
+\midrule
+MusicGen T5 text encoder & Frozen (unchanged) \\
+MusicGen LM decoder (cross-attention, self-attention, everything) & Frozen (unchanged) \\
+EnCodec tokenizer & Frozen (unchanged) \\
+Stage B video/text adapters (\texttt{AlignmentModel}) & Frozen (unchanged) \\
+Bridge network (\texttt{EmbeddingToConditioningBridge}) & \textbf{Retrained} (same module, new training context) \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+No MusicGen parameter ever receives a gradient under this proposal, matching the constraint of
+avoiding full or partial fine-tuning of the generative model. The retraining burden is identical
+in kind to what Milestone~1 already requires --- only the bridge's training loop changes, because
+the conditioning sequence it is optimized against now includes real T5 tokens alongside it rather
+than standing alone.
+
+\subsection{Why the bridge must be retrained, not reused as-is}
+The current checkpoint (\texttt{bridge\_best.pt}) was trained with the bridge's output as the
+\emph{entire} cross-attention context --- the decoder's teacher-forced loss shaped the bridge to
+carry all conditioning information by itself. Under the combined scheme, the decoder will have
+real semantic tokens present in the same context. Reusing the old checkpoint unchanged risks two
+failure modes:
+\begin{itemize}
+\item The bridge continues trying to encode content the T5 tokens already provide, wasting its
+limited capacity redundantly.
+\item The two token groups are not adapted to coexist in the same attention context, so the
+decoder may attend inconsistently between them (e.g.\ ignoring one entirely, since nothing in the
+old training objective taught it to blend both).
+\end{itemize}
+Retraining is a rerun of \texttt{train\_bridge.py}/\texttt{08\_bridge.ipynb}'s existing loop with
+one change to the forward call (Section~\ref{sec:mechanism}) --- no new data collection, no new
+architecture, no new frozen-vs-trainable boundary to design.
+
+\section{Training Data for the Combined Bridge}
+
+\subsection{Reuse the existing paired data}
+No new pairing problem is introduced. The same MATCH-clip (mood label, music audio) pairs used for
+the current bridge training (Section~\ref{sec:musicgen-recap}) remain the training target. The
+only addition is that each training example must now also carry its raw text --- for video-derived
+examples this can be a caption, a template string built from metadata, or (if unavailable) the
+class-name text used for the existing ``TEXT anchors'' evaluation; for text-mood-dataset examples,
+the raw sentence is already the natural choice for the semantic branch.
+
+\subsection{Two conditioning regimes worth training/evaluating separately}
+\begin{enumerate}
+\item \textbf{Video-anchored:} raw text $=$ a caption or template describing the clip (if
+available) or omitted (semantic branch degenerates to an empty/short sequence); mood vector $z$
+$=$ \texttt{encode\_video}. This isolates whether the bridge, trained with a semantic branch
+present, still steers mood correctly when the semantic branch carries little information.
+\item \textbf{Text-anchored:} raw text $=$ the actual input sentence; mood vector $z$ $=$
+\texttt{encode\_text} of the same sentence. This is the regime the new approach is really aimed
+at --- letting T5 read the sentence's real content while the mood branch supplies an explicit
+emotion signal independent of whether the sentence names the emotion outright.
+\end{enumerate}
+Because Stage~B's shared space is meant to be modality-agnostic, both regimes route through the
+same trained bridge; the difference is only which adapter produced $z$ and what text is fed to T5.
+
+\section{Evaluation Protocol}
+\label{sec:eval}
+Do not evaluate solely on the existing teacher-forced LM loss; that loss cannot distinguish
+``the decoder generates coherent audio'' from ``the decoder generates audio that reflects the
+requested mood.'' Reuse and extend the current qualitative protocol from
+\texttt{08\_bridge.ipynb}:
+\begin{enumerate}
+\item \textbf{Ablation A --- mood branch removed.} Generate with only the T5 sequence
+(\texttt{cond = T5(text)}, i.e.\ stock MusicGen behavior). This is the baseline the combined
+approach must beat on mood-consistency, since it is what MusicGen already does for free with no
+training at all.
+\item \textbf{Ablation B --- semantic branch removed.} Generate with only the bridge sequence
+(\texttt{cond = bridge(z)}), i.e.\ the current Milestone~1 design. This is the baseline the
+combined approach must not regress against.
+\item \textbf{Combined.} Generate with both concatenated. Listen for: (a) does content specificity
+improve over Ablation B (e.g.\ an explicit instrument or genre word in the text actually surfaces
+audibly), and (b) does mood-consistency hold up to Ablation A, especially for text that does not
+name the emotion directly.
+\item \textbf{Attention diagnostic (optional but cheap).} Inspect
+\texttt{cross\_attentions} returned by \texttt{Seq2SeqLMOutput} to check that decoder layers are
+not attending to one branch exclusively --- a collapse to one branch is the clearest sign the
+bridge needs more retraining or a rebalanced loss.
+\end{enumerate}
+
+\section{Feasibility Summary}
+
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{3.2cm} l X X@{}}
+\toprule
+\textbf{Component} & \textbf{Verdict} & \textbf{Key resource you have} & \textbf{Key open risk} \\
+\midrule
+Combined conditioning (concat T5 + bridge) &
+\good &
+Verified native support in \texttt{MusicgenForConditionalGeneration.forward}; no new frozen/trainable boundary &
+None architecturally; correctness depends on retraining quality, not feasibility \\
+\addlinespace
+Bridge retraining under new objective &
+\good &
+Same training loop, same paired MATCH-clip data, same compute footprint as current Milestone~1 &
+Old checkpoint is not reusable as-is (Section~2.4); must retrain from scratch or from a warm start \\
+\addlinespace
+Raw text for video-anchored examples &
+\risky &
+Text-mood dataset already supplies real sentences for the text-anchored regime &
+EmoMV videos may lack per-clip captions; may need templated or class-name placeholder text \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Recommended Next Steps}
+\begin{enumerate}
+\item Add a small helper that runs \texttt{musicgen.text\_encoder} directly on tokenized raw text
+(mirroring what \texttt{forward} does internally when \texttt{encoder\_outputs} is \texttt{None}),
+returning hidden states \emph{and} the padding mask.
+\item Change \texttt{run\_epoch} in \texttt{train\_bridge.py}/\texttt{08\_bridge.ipynb} to build
+\texttt{cond}/\texttt{attn\_mask} as the concatenation in Section~\ref{sec:mechanism} instead of
+\texttt{bridge(shared\_z)} alone, and retrain.
+\item Run the three-way ablation in Section~\ref{sec:eval} (T5-only, bridge-only, combined) on a
+handful of held-out examples before deciding this replaces Milestone~1's single-source design.
+\item Only if the combined approach is adopted: update
+\texttt{project/evaluation/generate\_samples.py} and the notebook's generation cells to build the
+same concatenated conditioning at inference time.
+\end{enumerate}
+
+\section*{Open Assumptions to Confirm}
+\addcontentsline{toc}{section}{Open Assumptions to Confirm}
+\begin{itemize}
+\item This plan assumes MusicGen's T5 text encoder is reachable directly as
+\texttt{musicgen.text\_encoder} in the installed \texttt{transformers} version (confirmed by
+source inspection at time of writing) --- worth a one-line sanity check against whatever version
+is pinned in \texttt{requirements.txt} before implementing.
+\item This plan assumes per-clip captions are not currently available for EmoMV video; if they
+are (or can cheaply be generated, e.g.\ via an off-the-shelf video-captioning model), the
+video-anchored regime in Section~3.2 becomes strictly more informative and should use real
+captions rather than template/class-name placeholders.
+\item This plan assumes the existing Stage~B retrieval gate (R@1 well above chance, per the
+cross-modal alignment plan's own evaluation protocol) has been or will be confirmed before relying
+on \texttt{encode\_text}-derived $z$ as a trustworthy mood signal in the text-anchored regime.
+\end{itemize}
+
+\section*{Recap: Referenced Prior Design}
+\label{sec:pairing-recap}
+\addcontentsline{toc}{section}{Recap: Referenced Prior Design}
+\subsection*{Stage B pairing recap}
+\label{sec:pairing-recap-detail}
+For readers who have not just reviewed \texttt{cross\_modal\_alignment\_plan.pdf}: Stage B trains
+two small adapters (video 512-d $\to$ $D{=}256$, text 768-d $\to$ $D{=}256$) with a label-anchored
+supervised contrastive loss, since no instance-level (video, caption) pairs exist --- only shared
+5-class labels. This gives coarse cross-modal mood alignment, not fine-grained semantic alignment
+within a class.
+
+\subsection*{Stage C Milestone 1 recap}
+\label{sec:musicgen-recap}
+Stage C's first milestone trains a bridge network
+$\mathbb{R}^{256} \to \mathbb{R}^{T \times 768}$ that maps a shared-space vector into MusicGen's
+T5-conditioning slot, using EmoMV's MATCH-clip audio (video emotion $=$ music emotion by
+construction) as the paired training target, with MusicGen itself fully frozen throughout. This
+document proposes extending that milestone's conditioning input, not replacing its data source or
+its frozen/trainable boundary.
+
+\end{document}

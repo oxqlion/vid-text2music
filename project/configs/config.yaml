@@ -139,7 +139,16 @@ stage_c:
   batch_size: 4
   lr: 0.0003
   weight_decay: 0.00001
-  max_epochs: 2                # small-subset validation run first (see plan doc roadmap)
-  subset_size: 300              # number of clips for the initial small-scale sanity pass
+  max_epochs: 200                # small-subset validation run first (see plan doc roadmap)
+  subset_size: 9999              # number of clips for the initial small-scale sanity pass
   early_stopping_patience: 5
   device_preference: ["mps", "cuda", "cpu"]
+  resume: true                  # if true, load bridge_checkpoint_name (model+optimizer+epoch) and continue instead of starting fresh
+
+  # Dual conditioning (see project/docs/text_conditioning_bridge_plan.pdf) --
+  # concatenate MusicGen's own frozen T5(text) sequence with the bridge's
+  # mood-steering sequence, instead of the bridge replacing T5 outright.
+  dual_conditioning: true
+  text_template: "{emotion} instrumental music"   # video-anchored raw text (no per-clip captions available)
+  text_max_length: 64
+  bridge_checkpoint_name: "bridge_dual_best.pt"    # keep Milestone-1 bridge_best.pt intact for the bridge-only ablation

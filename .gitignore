@@ -29,3 +29,7 @@ project/text_mood_clf_encoder/text_mood_clf/
 
 # ── Logs ───────────────────────────────────────────────────────
 project/logs/*
+
+# ── Generated audio samples ──
+*.wav
+project/evaluation/results/generated_samples/

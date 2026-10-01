@@ -1,5 +1,5 @@
-"""Stage C, Milestone 1 — generate a handful of .wav samples per emotion
-class for manual listening validation.
+"""Stage C, Milestone 1 (+ dual conditioning) — generate a handful of .wav
+samples per emotion class for manual listening validation.
 
 Two sources, on purpose:
   1. TEXT anchors (the 5 fixed class-name strings) -- out-of-distribution for
@@ -14,6 +14,17 @@ guidance path duplicates the batch against a null/unconditional embedding
 internally when conditioning via raw input_ids, which doesn't apply when we
 hand it custom encoder_outputs directly -- disabling it avoids a shape
 mismatch rather than silently producing wrong output.
+
+Three-way ablation (see project/docs/text_conditioning_bridge_plan.pdf,
+Section 4), per class/example:
+  A. T5-only  -- cond = MusicGen's own frozen T5(text); the baseline the
+     dual-conditioning approach must beat on mood-consistency, since it's
+     what stock MusicGen already does for free with no training at all.
+  B. bridge-only -- cond = bridge(z); the current Milestone 1 design, the
+     baseline the combined approach must not regress against.
+  C. combined -- cond = concat(T5(text), bridge(z)); the proposed approach.
+Loads `bridge_dual_best.pt` (retrained under the concatenated objective,
+see train_bridge.py) rather than the Milestone-1-only `bridge_best.pt`.
 """
 import sys
 from pathlib import Path
@@ -28,6 +39,8 @@ from project.config import load_config, resolve_path  # noqa: E402
 from project.datasets.feature_dataset import CachedEmbeddingDataset  # noqa: E402
 from project.models.adapters import AlignmentModel  # noqa: E402
 from project.models.bridge import EmbeddingToConditioningBridge  # noqa: E402
+from project.models.conditioning import build_musicgen_tokenizer, concat_conditioning, \
+    label_template_text, t5_encode  # noqa: E402
 from project.models.encoders import get_device  # noqa: E402
 from project.training.alignment_common import load_text_anchors  # noqa: E402
 from project.training.utils import load_checkpoint  # noqa: E402
@@ -50,6 +63,7 @@ def main():
 
     musicgen = MusicgenForConditionalGeneration.from_pretrained(sc_cfg["musicgen_model"]).to(device).eval()
     cond_dim = musicgen.config.text_encoder.d_model
+    tokenizer = build_musicgen_tokenizer(sc_cfg["musicgen_model"])
 
     alignment_model = AlignmentModel(
         shared_dim=a_cfg["shared_dim"], dropout=a_cfg["adapter_dropout"],
@@ -64,7 +78,13 @@ def main():
         hidden_dim=sc_cfg["bridge_hidden_dim"], n_heads=sc_cfg["bridge_n_heads"],
         n_layers=sc_cfg["bridge_n_layers"], dropout=sc_cfg["bridge_dropout"],
     ).to(device)
-    load_checkpoint(bridge, resolve_path(cfg, "paths.checkpoints_dir") / "bridge_best.pt", map_location=device)
+    # Dual-conditioning bridge checkpoint (retrained with T5 tokens present in
+    # the same context, Section 2.4 of the plan) -- NOT the Milestone-1-only
+    # bridge_best.pt, which was trained assuming it was the sole conditioning.
+    dual_conditioning = sc_cfg.get("dual_conditioning", False)
+    bridge_checkpoint_name = sc_cfg["bridge_checkpoint_name"] if dual_conditioning else "bridge_best.pt"
+    load_checkpoint(bridge, resolve_path(cfg, "paths.checkpoints_dir") / bridge_checkpoint_name,
+                     map_location=device)
     bridge.eval()
 
     out_dir = resolve_path(cfg, "paths.results_dir") / "generated_samples"
@@ -72,18 +92,35 @@ def main():
 
     sample_rate = sc_cfg["audio_sample_rate"]
     max_new_tokens = int(sc_cfg["clip_duration_s"] * 50)  # EnCodec's ~50 Hz frame rate at this config
+    text_max_length = sc_cfg.get("text_max_length", 64)
+
+    @torch.no_grad()
+    def generate_ablations(raw_texts, z):
+        """raw_texts: list[str] (len B), z: (B, shared_dim) mood vector (already
+        adapter-encoded) -> {tag: (B, 1, n_samples) audio} for the plan's
+        three-way ablation (Section 4): T5-only (stock MusicGen baseline),
+        bridge-only (current Milestone 1 design), and combined (proposed)."""
+        bridge_out = bridge(z)
+        bridge_mask = bridge.attention_mask(bridge_out.shape[0], device)
+        t5_hidden, t5_mask = t5_encode(musicgen, tokenizer, raw_texts, device, text_max_length)
+        combined_cond, combined_mask = concat_conditioning(t5_hidden, t5_mask, bridge_out, bridge_mask)
+        return {
+            "t5only": generate_from_conditioning(musicgen, t5_hidden, t5_mask, max_new_tokens),
+            "bridgeonly": generate_from_conditioning(musicgen, bridge_out, bridge_mask, max_new_tokens),
+            "combined": generate_from_conditioning(musicgen, combined_cond, combined_mask, max_new_tokens),
+        }
 
     print("\n--- Generating from TEXT anchors (out-of-distribution for the bridge) ---")
     text_z_raw, id2label = load_text_anchors(cfg, device)
     with torch.no_grad():
         text_z = alignment_model.encode_text(text_z_raw.to(device))
-        cond = bridge(text_z)
-        attn_mask = bridge.attention_mask(cond.shape[0], device)
-        audio = generate_from_conditioning(musicgen, cond, attn_mask, max_new_tokens)
+    raw_texts = [id2label[i] for i in range(len(id2label))]  # same row order as text_z_raw
+    audio_by_tag = generate_ablations(raw_texts, text_z)
     for i, label in id2label.items():
-        path = out_dir / f"text_{label}.wav"
-        torchaudio.save(str(path), audio[i].cpu(), sample_rate)
-        print(f"  saved {path}")
+        for tag, audio in audio_by_tag.items():
+            path = out_dir / f"text_{label}_{tag}.wav"
+            torchaudio.save(str(path), audio[i].cpu(), sample_rate)
+            print(f"  saved {path}")
 
     print("\n--- Generating from real VIDEO embeddings (in-distribution) ---")
     video_dir = resolve_path(cfg, "paths.video_embedding_512_dir")
@@ -96,17 +133,19 @@ def main():
         if len(picked) == len(id2label):
             break
 
+    text_template = sc_cfg.get("text_template", "{emotion} instrumental music")
     for label_id, (x, vid) in picked.items():
         with torch.no_grad():
             z = alignment_model.encode_video(x.unsqueeze(0).to(device))
-            cond = bridge(z)
-            attn_mask = bridge.attention_mask(1, device)
-            audio = generate_from_conditioning(musicgen, cond, attn_mask, max_new_tokens)
-        path = out_dir / f"video_{id2label[label_id]}_{vid}.wav"
-        torchaudio.save(str(path), audio[0].cpu(), sample_rate)
-        print(f"  saved {path}")
+        raw_text = label_template_text([label_id], id2label, text_template)  # no per-clip captions available
+        audio_by_tag = generate_ablations(raw_text, z)
+        for tag, audio in audio_by_tag.items():
+            path = out_dir / f"video_{id2label[label_id]}_{vid}_{tag}.wav"
+            torchaudio.save(str(path), audio[0].cpu(), sample_rate)
+            print(f"  saved {path}")
 
-    print(f"\nAll samples -> {out_dir}  (listen manually to assess mood-consistency)")
+    print(f"\nAll samples -> {out_dir}  (listen manually to assess mood-consistency and "
+          f"content specificity across the t5only / bridgeonly / combined ablation)")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
-"""Stage C, Milestone 1 — train the bridge adapter on (video embedding, real
-audio) pairs from EmoMV MATCH clips.
+"""Stage C, Milestone 1 (+ dual conditioning) — train the bridge adapter on
+(video embedding, real audio) pairs from EmoMV MATCH clips.
 
 Everything except the bridge is frozen: the Stage B AlignmentModel (already
 trained), and all of MusicGen (text encoder, audio encoder/EnCodec, LM
@@ -13,6 +13,14 @@ source, not assumed): `MusicgenForConditionalGeneration.forward` accepts
 `encoder_outputs=(tensor,)` to bypass its internal T5 call entirely, and
 `labels` (pre-computed EnCodec codes, shape (B*num_codebooks, seq_len)) to
 compute the LM loss via teacher forcing.
+
+Dual conditioning (`stage_c.dual_conditioning`, see
+project/docs/text_conditioning_bridge_plan.pdf): instead of the bridge output
+alone replacing T5's conditioning, MusicGen's own frozen T5 encoder is run on
+raw text (a class-name template, since EmoMV clips have no per-clip captions)
+and concatenated with the bridge's mood sequence along the time axis. Only
+the bridge is trained either way -- T5 stays frozen and is run under
+`torch.no_grad()`, so this adds no optimizer state versus Milestone 1.
 """
 import sys
 from pathlib import Path
@@ -28,6 +36,8 @@ from project.config import load_config, resolve_path  # noqa: E402
 from project.datasets.feature_dataset import CachedEmbeddingDataset  # noqa: E402
 from project.models.adapters import AlignmentModel  # noqa: E402
 from project.models.bridge import EmbeddingToConditioningBridge  # noqa: E402
+from project.models.conditioning import build_musicgen_tokenizer, concat_conditioning, \
+    label_template_text, t5_encode  # noqa: E402
 from project.models.encoders import get_device  # noqa: E402
 from project.training.utils import EarlyStopping, save_checkpoint, set_seed  # noqa: E402
 
@@ -35,10 +45,15 @@ from project.training.utils import EarlyStopping, save_checkpoint, set_seed  # n
 class VideoEmbeddingAudioDataset(Dataset):
     """Pairs a clip's 512-d video embedding with its own extracted audio
     track. Both come from the clip's `video_id` -- no extra pairing needed,
-    since a MATCH clip's video and audio are already the same file."""
+    since a MATCH clip's video and audio are already the same file.
+
+    Also carries each row's raw text for the dual-conditioning T5 branch:
+    since EmoMV videos have no per-clip captions, this is a fixed template
+    built from the clip's own emotion label (see `label_template_text`)."""
 
     def __init__(self, csv_path, video_dir: Path, audio_dir: Path, sample_rate: int, channels: int,
-                 clip_duration_s: float, subset_size: int = None, seed: int = 42):
+                 clip_duration_s: float, id2label: dict = None, text_template: str = None,
+                 subset_size: int = None, seed: int = 42):
         self.base = CachedEmbeddingDataset(csv_path, [(video_dir, "video_id")])
         has_audio = self.base.df["video_id"].apply(lambda vid: (audio_dir / f"{vid}.wav").exists())
         n_missing = int((~has_audio).sum())
@@ -54,6 +69,8 @@ class VideoEmbeddingAudioDataset(Dataset):
         self.sample_rate = sample_rate
         self.channels = channels
         self.n_samples = int(clip_duration_s * sample_rate)
+        self.id2label = id2label
+        self.text_template = text_template
 
     def __len__(self) -> int:
         return len(self.base)
@@ -69,6 +86,10 @@ class VideoEmbeddingAudioDataset(Dataset):
             waveform = torch.nn.functional.pad(waveform, (0, self.n_samples - waveform.shape[1]))
         else:
             waveform = waveform[:, : self.n_samples]
+
+        if self.id2label is not None:
+            text = label_template_text([label], self.id2label, self.text_template)[0]
+            return video_embedding, waveform, label, video_id, text
         return video_embedding, waveform, label, video_id
 
 
@@ -121,16 +142,26 @@ def main():
         n_layers=sc_cfg["bridge_n_layers"], dropout=sc_cfg["bridge_dropout"],
     ).to(device)
 
+    dual_conditioning = sc_cfg.get("dual_conditioning", False)
+    tokenizer = None
+    if dual_conditioning:
+        print("Dual conditioning enabled: concatenating MusicGen's frozen T5(text) with bridge(z).")
+        tokenizer = build_musicgen_tokenizer(sc_cfg["musicgen_model"])
+    id2label = {v: k for k, v in cfg["emotion_to_id"].items()} if dual_conditioning else None
+    text_template = sc_cfg.get("text_template")
+
     video_dir = resolve_path(cfg, "paths.video_embedding_512_dir")
     audio_dir = resolve_path(cfg, "paths.audio_targets_dir")
     train_ds = VideoEmbeddingAudioDataset(
         resolve_path(cfg, "paths.train_csv"), video_dir, audio_dir,
         sc_cfg["audio_sample_rate"], sc_cfg["audio_channels"], sc_cfg["clip_duration_s"],
+        id2label=id2label, text_template=text_template,
         subset_size=sc_cfg["subset_size"], seed=cfg["seed"],
     )
     val_ds = VideoEmbeddingAudioDataset(
         resolve_path(cfg, "paths.val_csv"), video_dir, audio_dir,
         sc_cfg["audio_sample_rate"], sc_cfg["audio_channels"], sc_cfg["clip_duration_s"],
+        id2label=id2label, text_template=text_template,
         subset_size=max(sc_cfg["subset_size"] // 5, 10), seed=cfg["seed"],
     )
     print(f"train: {len(train_ds)}  val: {len(val_ds)}")
@@ -140,17 +171,37 @@ def main():
 
     optimizer = torch.optim.AdamW(bridge.parameters(), lr=sc_cfg["lr"], weight_decay=sc_cfg["weight_decay"])
     early_stopping = EarlyStopping(patience=sc_cfg["early_stopping_patience"], mode="min")
-    checkpoint_path = resolve_path(cfg, "paths.checkpoints_dir") / "bridge_best.pt"
+    checkpoint_name = sc_cfg["bridge_checkpoint_name"] if dual_conditioning else "bridge_best.pt"
+    checkpoint_path = resolve_path(cfg, "paths.checkpoints_dir") / checkpoint_name
+
+    start_epoch = 1
+    if sc_cfg.get("resume", False) and checkpoint_path.exists():
+        ckpt = load_checkpoint(bridge, checkpoint_path, optimizer=optimizer, map_location=device)
+        start_epoch = ckpt["epoch"] + 1
+        early_stopping.best_score = ckpt["metrics"]["val_loss"]
+        print(f"Resumed from {checkpoint_path} (epoch {ckpt['epoch']}, "
+              f"best val_loss={early_stopping.best_score:.4f}) -- continuing at epoch {start_epoch}")
 
     def run_epoch(loader, train: bool):
         bridge.train(train)
         total_loss, n_batches = 0.0, 0
-        for video_emb, waveform, _labels, _video_ids in loader:
+        for batch in loader:
+            if dual_conditioning:
+                video_emb, waveform, _labels, _video_ids, texts = batch
+            else:
+                video_emb, waveform, _labels, _video_ids = batch
             video_emb, waveform = video_emb.to(device), waveform.to(device)
             with torch.no_grad():
                 shared_z = alignment_model.encode_video(video_emb)  # (B, shared_dim), frozen
-            cond = bridge(shared_z)  # (B, T, cond_dim) -- only this has gradients
-            attn_mask = bridge.attention_mask(cond.shape[0], device)
+            bridge_out = bridge(shared_z)  # (B, T_bridge, cond_dim) -- only this has gradients
+            bridge_mask = bridge.attention_mask(bridge_out.shape[0], device)
+
+            if dual_conditioning:
+                t5_hidden, t5_mask = t5_encode(musicgen, tokenizer, texts, device, sc_cfg["text_max_length"])
+                cond, attn_mask = concat_conditioning(t5_hidden, t5_mask, bridge_out, bridge_mask)
+            else:
+                cond, attn_mask = bridge_out, bridge_mask
+
             codec_labels = audio_to_labels(musicgen, waveform)
 
             out = musicgen(encoder_outputs=(cond,), attention_mask=attn_mask, labels=codec_labels)
@@ -165,7 +216,7 @@ def main():
             n_batches += 1
         return total_loss / max(n_batches, 1)
 
-    for epoch in range(1, sc_cfg["max_epochs"] + 1):
+    for epoch in range(start_epoch, sc_cfg["max_epochs"] + 1):
         train_loss = run_epoch(train_loader, train=True)
         with torch.no_grad():
             val_loss = run_epoch(val_loader, train=False)
